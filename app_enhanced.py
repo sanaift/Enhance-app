@@ -22,6 +22,12 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
 import streamlit as st
 import pandas as pd
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    _PLOTLY = True
+except ImportError:
+    _PLOTLY = False
 
 try:
     from sklearn.ensemble import IsolationForest, RandomForestClassifier
@@ -802,14 +808,18 @@ class AdaptiveController:
 
 def _multi_domain_data_generator(
     attack_probability: float = 0.20,
-    seed: int = 42
+    seed: int = 42,
+    t_offset: int = 0,
 ) -> Callable[[], Dict[str, Any]]:
     """
     Generates multi-domain smart grid sensor data with labelled threats.
     Domains: network traffic, physical sensors, SCADA, DER.
+    seed=0 means fully random (uses system time), ensuring different results each run.
+    t_offset shifts the phase of periodic signals so repeated runs look different.
     """
-    rng = random.Random(seed)
-    _t = [0]
+    actual_seed = seed if seed != 0 else int(time.time() * 1000) % 999999
+    rng = random.Random(actual_seed)
+    _t = [t_offset]
 
     def _generate() -> Dict[str, Any]:
         t = _t[0]
@@ -967,7 +977,21 @@ st.markdown("""
     .threat-high { color: #ff4444; font-weight: bold; }
     .threat-med  { color: #ffa500; font-weight: bold; }
     .threat-low  { color: #44cc44; font-weight: bold; }
-    .agent-card  { background: #1a1a2e; padding: 12px; border-radius: 8px; margin-bottom: 8px; border-left: 4px solid #4CAF50; }
+    .agent-card {
+        background: #FFFFFF;
+        border: 1px solid #D0D8E8;
+        padding: 14px 18px;
+        border-radius: 10px;
+        margin-bottom: 10px;
+        border-left: 5px solid #2E75B6;
+        color: #1A1A1A;
+        font-family: Arial, sans-serif;
+    }
+    .agent-card .agent-name { font-size: 15px; font-weight: bold; color: #1F4E79; }
+    .agent-card .agent-layer { font-size: 12px; color: #2E75B6; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+    .agent-card .agent-role { font-size: 12px; color: #444; margin-bottom: 6px; font-style: italic; }
+    .agent-card .agent-stats { font-size: 13px; color: #222; }
+    .agent-card .stat-badge { display: inline-block; background: #EBF3FB; color: #1F4E79; border-radius: 4px; padding: 2px 8px; margin-right: 6px; font-weight: 600; font-size: 12px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -987,6 +1011,32 @@ with st.sidebar:
     n_cycles = st.number_input("Simulation Cycles", 50, 500, 150, step=50)
     use_adaptive = st.checkbox("Enable Adaptive Controller", value=True)
     seed = st.number_input("Random Seed", 0, 9999, 42)
+    st.divider()
+    st.subheader("📂 Dataset Source")
+    dataset_mode = st.radio(
+        "Choose data source:",
+        ["🔧 Synthetic (built-in generator)",
+         "📁 Dataset 1 — Smart Grid Synthetic (Custom CSV)",
+         "📡 Dataset 2 — TON_IoT Style (UNSW Sydney)"],
+        index=0,
+        help="Dataset 2 uses TON_IoT schema (Moustafa 2021) with different "
+             "signal ranges, 60Hz grid, wind-dominant DER, and gas-pipeline SCADA."
+    )
+    uploaded_file = None
+    if "Dataset 1" in dataset_mode or "Dataset 2" in dataset_mode:
+        uploaded_file = st.file_uploader(
+            "Upload CSV (columns: packet_rate, latency_ms, voltage, current, "
+            "frequency, register_value, pv_output_pu, setpoint — optionally: true_threat)",
+            type=["csv"],
+            help="For Dataset 2, use the TON_IoT-style sample CSV provided."
+        )
+        if uploaded_file is not None:
+            st.success(f"✅ Loaded: {uploaded_file.name}")
+        else:
+            if "Dataset 2" in dataset_mode:
+                st.info("Upload the **ton_iot_smartgrid_dataset.csv** file above.")
+            else:
+                st.info("Upload the **sample_smartgrid_dataset.csv** file above.")
     run_btn = st.button("▶ Run Simulation", type="primary", use_container_width=True)
 
 # ---- State ----
@@ -994,10 +1044,88 @@ for k in ["results", "fw", "ctrl", "threshold_history"]:
     if k not in st.session_state:
         st.session_state[k] = None
 
+# ────────────────────────────────────────────────────────────────────────────
+# CSV Dataset Parser
+# ────────────────────────────────────────────────────────────────────────────
+EXPECTED_COLS = {
+    "network": ["packet_rate", "latency_ms", "packet_loss", "syn_ratio"],
+    "physical": ["voltage", "current", "frequency", "temperature_c"],
+    "scada":   ["register_value", "command_id"],
+    "der":     ["pv_output_pu", "wind_output_pu", "setpoint", "battery_soc"],
+}
+
+def _parse_uploaded_csv(df: pd.DataFrame) -> list:
+    """
+    Convert an uploaded DataFrame into the dict format expected by AgenticFramework.run_cycle().
+    Missing columns are filled with domain-appropriate defaults.
+    Supports flexible column names (case-insensitive, underscore/space tolerant).
+    """
+    # Normalise column names
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+    records = []
+    for i, row in df.iterrows():
+        def g(col, default=0.0):
+            """Get column value with fallback."""
+            return float(row[col]) if col in row.index else default
+
+        # Network
+        packet_rate = g("packet_rate", 120.0)
+        latency_ms  = g("latency_ms",  8.0)
+        packet_loss = g("packet_loss", 0.002)
+        syn_ratio   = g("syn_ratio",   0.05)
+        net_feats   = [packet_rate / 1000, latency_ms / 200, packet_loss * 100, syn_ratio * 10]
+
+        # Physical
+        voltage     = g("voltage",     1.0)
+        current     = g("current",     0.8)
+        frequency   = g("frequency",   50.0)
+        temperature = g("temperature_c", 35.0)
+        phys_feats  = [voltage, current, frequency / 50, temperature / 100]
+
+        # SCADA
+        reg_val     = g("register_value", 100.0)
+        cmd_id      = g("command_id",     2.0)
+        scada_feats = [cmd_id / 255, reg_val / 200, 0.0, 0.0]
+
+        # DER
+        pv_out      = g("pv_output_pu",  0.5)
+        wind_out    = g("wind_output_pu",0.4)
+        setpt       = g("setpoint",      0.5)
+        batt_soc    = g("battery_soc",   0.7)
+        der_feats   = [pv_out, wind_out, setpt, batt_soc]
+
+        true_threat = str(row["true_threat"]).strip() if "true_threat" in row.index else "normal"
+        if true_threat not in THREAT_LABELS:
+            true_threat = "normal"
+
+        all_values = net_feats + phys_feats + scada_feats + der_feats
+        records.append({
+            "timestamp":   i,
+            "true_threat": true_threat,
+            "network":  {"packet_rate": packet_rate, "latency_ms": latency_ms,
+                         "packet_loss": packet_loss, "syn_ratio": syn_ratio,
+                         "replay_flag": False, "scanning": False, "features": net_feats},
+            "physical": {"voltage": voltage, "current": current, "frequency": frequency,
+                         "temperature_c": temperature, "voltage_deviation": abs(voltage - 1.0),
+                         "overload": current > 1.5, "features": phys_feats},
+            "scada":    {"command_id": int(cmd_id), "register_value": reg_val,
+                         "command_anomaly": False, "unauthorized": False, "features": scada_feats},
+            "der":      {"pv_output_pu": pv_out, "wind_output_pu": wind_out,
+                         "setpoint": setpt, "setpoint_delta": 0.0,
+                         "battery_soc": batt_soc, "features": der_feats},
+            "values":   all_values,
+            "features": [[v] for v in all_values],
+            "source_nodes": [],
+        })
+    return records
+
 # ---- Run Simulation ----
 if run_btn:
-    random.seed(seed)
-    np.random.seed(seed)
+    # Seed numpy for IsolationForest reproducibility.
+    # The data generator uses its own Random(seed) instance + t_offset
+    # so results vary each run while remaining reproducible when seed != 0.
+    np.random.seed(seed if seed != 0 else None)
 
     fw = AgenticFramework(config_overrides={
         "behavioral_sensitivity": sens,
@@ -1006,20 +1134,40 @@ if run_btn:
         "strategy_exploration_rate": expl,
     })
     ctrl = AdaptiveController(framework=fw) if use_adaptive else None
-    data_gen = _multi_domain_data_generator(attack_probability=attack_prob, seed=seed)
+    # ── DATA SOURCE: uploaded CSV or synthetic generator ────────────────────
+    use_uploaded = uploaded_file is not None
+    if use_uploaded:
+        try:
+            csv_df = pd.read_csv(uploaded_file)
+            dataset_records = _parse_uploaded_csv(csv_df)
+            total_cycles = len(dataset_records)
+            st.sidebar.success(f"Using uploaded dataset: {total_cycles} rows")
+        except Exception as e:
+            st.error(f"Failed to parse CSV: {e}")
+            st.stop()
+    else:
+        # Synthetic generator: t_offset makes every run produce different signals
+        # even when the same seed is chosen, because the sine wave phase shifts.
+        t_offset = int(time.time()) % 10000
+        data_gen = _multi_domain_data_generator(
+            attack_probability=attack_prob,
+            seed=seed,
+            t_offset=t_offset,
+        )
+        total_cycles = int(n_cycles)
 
     cycle_outputs = []
     threshold_history = []
 
     progress = st.progress(0, text="Running simulation...")
-    for i in range(int(n_cycles)):
-        sensor_data = data_gen()
+    for i in range(total_cycles):
+        sensor_data = dataset_records[i] if use_uploaded else data_gen()
         out = fw.run_cycle(sensor_data)
         cycle_outputs.append(out)
         threshold_history.append(fw.runtime_config.snapshot())
         if ctrl:
             ctrl.adapt(out)
-        progress.progress((i + 1) / int(n_cycles), text=f"Cycle {i+1}/{int(n_cycles)}")
+        progress.progress((i + 1) / total_cycles, text=f"Cycle {i+1}/{total_cycles}")
 
     progress.empty()
     st.session_state.results = cycle_outputs
@@ -1035,6 +1183,19 @@ if st.session_state.results:
 
     # KPIs
     st.subheader("📊 Simulation Summary")
+    if uploaded_file is not None:
+        ds_name = uploaded_file.name
+        if "ton_iot" in ds_name.lower() or "Dataset 2" in dataset_mode:
+            data_source_label = f"📡 Dataset 2 — TON_IoT Style (UNSW Sydney 2021): {ds_name}"
+            dataset_id = "DS2"
+        else:
+            data_source_label = f"📁 Dataset 1 — Smart Grid Custom CSV: {ds_name}"
+            dataset_id = "DS1"
+    else:
+        data_source_label = "🔧 Synthetic Multi-Domain Generator (built-in)"
+        dataset_id = "SYN"
+    st.info(f"**Data source:** {data_source_label}  |  **Domains:** Network · Physical · SCADA · DER  |  **Features:** 16 total (4 per domain)")
+    st.session_state["dataset_id"] = dataset_id
     anomaly_counts  = [r["anomaly"]["anomaly_count"] for r in results]
     cascade_depths  = [r["cascade"]["cascade_depth"] for r in results]
     affected_counts = [r["cascade"]["affected_count"] for r in results]
@@ -1067,15 +1228,37 @@ if st.session_state.results:
 
     # ---- TAB 1: Detection ----
     with tab1:
-        st.subheader("Anomaly Detection Over Time")
-        df_anom = pd.DataFrame({
-            "Cycle": range(1, len(results) + 1),
-            "Envelope Anomalies": [r["envelope"]["anomaly_count"] for r in results],
-            "ML Anomalies":       [r["anomaly"]["anomaly_count"] for r in results],
-        })
-        st.line_chart(df_anom.set_index("Cycle"))
+        st.markdown("""
+<div style="background:#EBF3FB;border-left:5px solid #2E75B6;padding:10px 16px;border-radius:6px;margin-bottom:14px;">
+<span style="font-size:13px;color:#2E75B6;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">Layer 1 — Perceptual</span><br>
+<span style="font-size:15px;font-weight:bold;color:#1F4E79;">BehavioralEnvelopeAgent</span>
+<span style="color:#555;font-size:13px;"> — Rolling σ-based deviation detector (window=50)</span>&nbsp;&nbsp;
+<span style="font-size:15px;font-weight:bold;color:#1F4E79;">AnomalyDetectionAgent</span>
+<span style="color:#555;font-size:13px;"> — IsolationForest unsupervised ML outlier detection</span>
+</div>""", unsafe_allow_html=True)
 
-        st.subheader("Multi-Domain Sensor Readings (All Cycles)")
+        st.subheader("Anomaly Detection Over Time")
+        cycles_ax = list(range(1, len(results) + 1))
+        env_vals  = [r["envelope"]["anomaly_count"] for r in results]
+        ml_vals   = [r["anomaly"]["anomaly_count"]  for r in results]
+        if _PLOTLY:
+            fig_anom = go.Figure()
+            fig_anom.add_trace(go.Scatter(x=cycles_ax, y=env_vals, mode="lines",
+                name="Envelope Anomalies (BehavioralEnvelopeAgent)",
+                line=dict(color="#E63946", width=2)))
+            fig_anom.add_trace(go.Scatter(x=cycles_ax, y=ml_vals, mode="lines",
+                name="ML Anomalies (AnomalyDetectionAgent)",
+                line=dict(color="#2A9D8F", width=2, dash="dot")))
+            fig_anom.update_layout(xaxis_title="Cycle", yaxis_title="Anomaly Count",
+                legend=dict(orientation="h", y=-0.25),
+                margin=dict(l=40,r=20,t=30,b=60), height=320,
+                plot_bgcolor="#F8FAFF", paper_bgcolor="#F8FAFF")
+            st.plotly_chart(fig_anom, use_container_width=True)
+        else:
+            df_anom = pd.DataFrame({"Cycle": cycles_ax,
+                "Envelope Anomalies": env_vals, "ML Anomalies": ml_vals})
+            st.line_chart(df_anom.set_index("Cycle"))
+
         df_sensors = pd.DataFrame([{
             "Cycle":         r["cycle"],
             "Packet Rate":   r["fused"]["network"].get("packet_rate", 0),
@@ -1086,15 +1269,66 @@ if st.session_state.results:
             "PV Output":     r["fused"]["der"].get("pv_output_pu", 0),
             "SCADA Reg Val": r["fused"]["scada"].get("register_value", 0),
         } for r in results])
-        st.subheader("Voltage & Current Over Time")
-        st.line_chart(df_sensors.set_index("Cycle")[["Voltage (pu)", "Current (pu)", "Frequency (Hz)"]])
-        st.subheader("Network Traffic Over Time")
-        st.line_chart(df_sensors.set_index("Cycle")[["Packet Rate", "Latency (ms)"]])
-        st.subheader("DER & SCADA Over Time")
-        st.line_chart(df_sensors.set_index("Cycle")[["PV Output", "SCADA Reg Val"]])
+
+        if _PLOTLY:
+            st.subheader("Physical Domain — Voltage, Current & Frequency")
+            fig_phys = go.Figure()
+            fig_phys.add_trace(go.Scatter(x=df_sensors["Cycle"], y=df_sensors["Voltage (pu)"],
+                name="Voltage (pu)", line=dict(color="#E63946", width=2)))
+            fig_phys.add_trace(go.Scatter(x=df_sensors["Cycle"], y=df_sensors["Current (pu)"],
+                name="Current (pu)", line=dict(color="#F4A261", width=2)))
+            fig_phys.add_trace(go.Scatter(x=df_sensors["Cycle"], y=df_sensors["Frequency (Hz)"] / 50,
+                name="Frequency /50 (normalised)", line=dict(color="#2A9D8F", width=2, dash="dash")))
+            fig_phys.update_layout(xaxis_title="Cycle", yaxis_title="Value",
+                legend=dict(orientation="h",y=-0.3),
+                margin=dict(l=40,r=20,t=30,b=70), height=300,
+                plot_bgcolor="#F8FAFF", paper_bgcolor="#F8FAFF")
+            st.plotly_chart(fig_phys, use_container_width=True)
+
+            st.subheader("Network Domain — Traffic Features")
+            fig_net = go.Figure()
+            fig_net.add_trace(go.Scatter(x=df_sensors["Cycle"], y=df_sensors["Packet Rate"],
+                name="Packet Rate (pkts/s)", line=dict(color="#264653", width=2)))
+            fig_net.add_trace(go.Scatter(x=df_sensors["Cycle"], y=df_sensors["Latency (ms)"],
+                name="Latency (ms)", line=dict(color="#E9C46A", width=2, dash="dot"),
+                yaxis="y2"))
+            fig_net.update_layout(
+                xaxis_title="Cycle",
+                yaxis=dict(title="Packet Rate", color="#264653"),
+                yaxis2=dict(title="Latency (ms)", overlaying="y", side="right", color="#E9C46A"),
+                legend=dict(orientation="h",y=-0.3),
+                margin=dict(l=40,r=60,t=30,b=70), height=300,
+                plot_bgcolor="#F8FAFF", paper_bgcolor="#F8FAFF")
+            st.plotly_chart(fig_net, use_container_width=True)
+
+            st.subheader("DER & SCADA Domains")
+            fig_der = go.Figure()
+            fig_der.add_trace(go.Scatter(x=df_sensors["Cycle"], y=df_sensors["PV Output"],
+                name="PV Output (pu)", line=dict(color="#E76F51", width=2)))
+            fig_der.add_trace(go.Scatter(x=df_sensors["Cycle"], y=df_sensors["SCADA Reg Val"],
+                name="SCADA Register Value", line=dict(color="#6A0572", width=2, dash="dash"),
+                yaxis="y2"))
+            fig_der.update_layout(
+                xaxis_title="Cycle",
+                yaxis=dict(title="PV Output (pu)", color="#E76F51"),
+                yaxis2=dict(title="SCADA Register", overlaying="y", side="right", color="#6A0572"),
+                legend=dict(orientation="h",y=-0.3),
+                margin=dict(l=40,r=60,t=30,b=70), height=300,
+                plot_bgcolor="#F8FAFF", paper_bgcolor="#F8FAFF")
+            st.plotly_chart(fig_der, use_container_width=True)
+        else:
+            st.line_chart(df_sensors.set_index("Cycle")[["Voltage (pu)", "Current (pu)", "Frequency (Hz)"]])
+            st.line_chart(df_sensors.set_index("Cycle")[["Packet Rate", "Latency (ms)"]])
+            st.line_chart(df_sensors.set_index("Cycle")[["PV Output", "SCADA Reg Val"]])
 
     # ---- TAB 2: Threat Classification ----
     with tab2:
+        st.markdown("""
+<div style="background:#EDF7ED;border-left:5px solid #375623;padding:10px 16px;border-radius:6px;margin-bottom:14px;">
+<span style="font-size:13px;color:#375623;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">Layer 2 — Cognitive</span><br>
+<span style="font-size:15px;font-weight:bold;color:#1F3319;">ThreatClassifierAgent</span>
+<span style="color:#555;font-size:13px;"> — Random Forest supervised classifier (10 threat classes, balanced weights, online learning)</span>
+</div>""", unsafe_allow_html=True)
         st.subheader("Threat Type Distribution")
         from collections import Counter
         true_dist = Counter(threats_true)
@@ -1139,6 +1373,12 @@ if st.session_state.results:
 
     # ---- TAB 3: Model Performance ----
     with tab3:
+        st.markdown("""
+<div style="background:#EDF7ED;border-left:5px solid #375623;padding:10px 16px;border-radius:6px;margin-bottom:14px;">
+<span style="font-size:13px;color:#375623;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">Layer 2 — Cognitive</span><br>
+<span style="font-size:15px;font-weight:bold;color:#1F3319;">ThreatClassifierAgent</span>
+<span style="color:#555;font-size:13px;"> — Real-time performance evaluation: Accuracy · Precision · Recall · F1 · Confusion Matrix · Detection Latency</span>
+</div>""", unsafe_allow_html=True)
         st.subheader("🎯 Classifier Performance Metrics")
         metrics = fw.threat_classifier_agent.get_performance_metrics()
 
@@ -1198,13 +1438,33 @@ if st.session_state.results:
 
     # ---- TAB 4: Cascade Analysis ----
     with tab4:
+        st.markdown("""
+<div style="background:#EDF7ED;border-left:5px solid #375623;padding:10px 16px;border-radius:6px;margin-bottom:14px;">
+<span style="font-size:13px;color:#375623;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">Layer 2 — Cognitive</span><br>
+<span style="font-size:15px;font-weight:bold;color:#1F3319;">CascadePredictorAgent</span>
+<span style="color:#555;font-size:13px;"> — BFS graph traversal over grid topology — predicts fault spread across substations, feeders and load centers</span>
+</div>""", unsafe_allow_html=True)
         st.subheader("Cascade Propagation Over Time")
         df_casc = pd.DataFrame({
             "Cycle": range(1, len(results) + 1),
             "Cascade Depth":  cascade_depths,
             "Affected Nodes": affected_counts,
         })
-        st.area_chart(df_casc.set_index("Cycle"))
+        if _PLOTLY:
+            fig_casc = go.Figure()
+            fig_casc.add_trace(go.Scatter(x=df_casc["Cycle"], y=df_casc["Affected Nodes"],
+                fill="tozeroy", name="Affected Nodes", line=dict(color="#E63946"),
+                fillcolor="rgba(230,57,70,0.15)"))
+            fig_casc.add_trace(go.Scatter(x=df_casc["Cycle"], y=df_casc["Cascade Depth"],
+                fill="tozeroy", name="Cascade Depth", line=dict(color="#264653"),
+                fillcolor="rgba(38,70,83,0.20)"))
+            fig_casc.update_layout(xaxis_title="Cycle", yaxis_title="Count",
+                legend=dict(orientation="h",y=-0.3),
+                margin=dict(l=40,r=20,t=20,b=60), height=300,
+                plot_bgcolor="#F8FAFF", paper_bgcolor="#F8FAFF")
+            st.plotly_chart(fig_casc, use_container_width=True)
+        else:
+            st.area_chart(df_casc.set_index("Cycle"))
 
         st.subheader("Last Cycle Cascade Details")
         last_cascade = results[-1]["cascade"]
@@ -1222,10 +1482,28 @@ if st.session_state.results:
 
     # ---- TAB 5: Mitigation ----
     with tab5:
+        st.markdown("""
+<div style="background:#FEF3E2;border-left:5px solid #843C0C;padding:10px 16px;border-radius:6px;margin-bottom:14px;">
+<span style="font-size:13px;color:#843C0C;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">Layer 3 — Strategic</span><br>
+<span style="font-size:15px;font-weight:bold;color:#5C2900;">MitigationGeneratorAgent</span>
+<span style="color:#555;font-size:13px;"> — ε-greedy Q-Learning policy with threat-affinity mapping over 8 response strategies</span>
+</div>""", unsafe_allow_html=True)
         st.subheader("Mitigation Strategy Distribution")
         strat_counts = {s: strategies.count(s) for s in set(strategies)}
         df_strat = pd.DataFrame({"Strategy": list(strat_counts.keys()), "Count": list(strat_counts.values())})
-        st.bar_chart(df_strat.sort_values("Count", ascending=False).set_index("Strategy"))
+        df_strat = df_strat.sort_values("Count", ascending=False)
+        if _PLOTLY:
+            palette = ["#E63946","#F4A261","#2A9D8F","#264653","#E9C46A","#6A0572","#E76F51","#457B9D"]
+            fig_strat = go.Figure(go.Bar(
+                x=df_strat["Strategy"], y=df_strat["Count"],
+                marker_color=palette[:len(df_strat)],
+                text=df_strat["Count"], textposition="outside"))
+            fig_strat.update_layout(xaxis_title="Strategy", yaxis_title="Times Selected",
+                margin=dict(l=40,r=20,t=20,b=80), height=320,
+                plot_bgcolor="#F8FAFF", paper_bgcolor="#F8FAFF")
+            st.plotly_chart(fig_strat, use_container_width=True)
+        else:
+            st.bar_chart(df_strat.set_index("Strategy"))
 
         st.subheader("Strategy-to-Threat Affinity Map")
         affinity_rows = []
@@ -1253,6 +1531,12 @@ if st.session_state.results:
 
     # ---- TAB 6: Adaptive Learning ----
     with tab6:
+        st.markdown("""
+<div style="background:#F3EBF8;border-left:5px solid #7030A0;padding:10px 16px;border-radius:6px;margin-bottom:14px;">
+<span style="font-size:13px;color:#7030A0;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">Cross-Layer — Feedback Controller</span><br>
+<span style="font-size:15px;font-weight:bold;color:#4B0082;">AdaptiveController + LearningController</span>
+<span style="color:#555;font-size:13px;"> — Auto-tunes 4 global parameters every cycle using FP/FN/cascade/mitigation proxy metrics</span>
+</div>""", unsafe_allow_html=True)
         st.subheader("Adaptive Parameter Evolution")
         if th_hist:
             df_thresh = pd.DataFrame(th_hist)
@@ -1261,7 +1545,24 @@ if st.session_state.results:
             df_thresh = df_thresh[[p for p in params if p in df_thresh.columns]]
             df_thresh.index = range(1, len(df_thresh) + 1)
             df_thresh.index.name = "Cycle"
-            st.line_chart(df_thresh)
+            if _PLOTLY:
+                adapt_colors = {"behavioral_sensitivity":"#E63946",
+                                "anomaly_contamination":"#2A9D8F",
+                                "cascade_propagation_threshold":"#E9C46A",
+                                "strategy_exploration_rate":"#6A0572"}
+                fig_adapt = go.Figure()
+                for col in df_thresh.columns:
+                    fig_adapt.add_trace(go.Scatter(
+                        x=df_thresh.index, y=df_thresh[col],
+                        name=col.replace("_"," ").title(),
+                        line=dict(color=adapt_colors.get(col,"#333"), width=2)))
+                fig_adapt.update_layout(xaxis_title="Cycle",
+                    legend=dict(orientation="h",y=-0.35),
+                    margin=dict(l=40,r=20,t=20,b=80), height=320,
+                    plot_bgcolor="#F8FAFF", paper_bgcolor="#F8FAFF")
+                st.plotly_chart(fig_adapt, use_container_width=True)
+            else:
+                st.line_chart(df_thresh)
 
             st.subheader("Parameter Convergence (Std Dev)")
             conv_data = {p: round(df_thresh[p].std(), 6) for p in params if p in df_thresh.columns}
@@ -1275,16 +1576,86 @@ if st.session_state.results:
 
     # ---- TAB 7: Agent Status ----
     with tab7:
-        st.subheader("Agent Performance Status")
-        for agent in fw.get_agents():
-            stats = agent.performance_stats
-            avg_time = (stats["total_time_ms"] / stats["total_calls"]) if stats["total_calls"] > 0 else 0
-            st.markdown(f"""
-<div class="agent-card">
-<b>{agent.agent_id}</b><br>
-Calls: {stats['total_calls']} | Avg time: {avg_time:.3f} ms | Total time: {stats['total_time_ms']:.2f} ms
+        st.markdown("""
+<div style="background:#E8F0F8;border-left:5px solid #1F4E79;padding:10px 16px;border-radius:6px;margin-bottom:14px;">
+<span style="font-size:13px;color:#1F4E79;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">All Layers — Framework Agents</span><br>
+<span style="color:#333;font-size:13px;">Processing latency, call count, and layer assignment for every agent in the pipeline.</span>
 </div>""", unsafe_allow_html=True)
 
+        AGENT_META = {
+            "data_fusion":        ("Layer 0 — Data Fusion",    "#4472C4", "Unifies network, physical, SCADA, DER into 16-dim feature vector"),
+            "behavioral_envelope":("Layer 1 — Perceptual",     "#2E75B6", "Rolling σ-window envelope anomaly detector"),
+            "anomaly_detection":  ("Layer 1 — Perceptual",     "#2E75B6", "IsolationForest unsupervised ML outlier detection"),
+            "threat_classifier":  ("Layer 2 — Cognitive",      "#375623", "Random Forest 10-class threat classifier (online learning)"),
+            "cascade_predictor":  ("Layer 2 — Cognitive",      "#375623", "BFS graph cascade propagation predictor"),
+            "mitigation_generator":("Layer 3 — Strategic",     "#843C0C", "ε-greedy Q-Learning mitigation policy planner"),
+        }
+        st.subheader("Agent Performance Status")
+        for agent in fw.get_agents():
+            stats    = agent.performance_stats
+            avg_time = (stats["total_time_ms"] / stats["total_calls"]) if stats["total_calls"] > 0 else 0
+            meta     = AGENT_META.get(agent.agent_id, ("Unknown Layer","#888",""))
+            layer_label, layer_color, role_desc = meta
+            st.markdown(f"""
+<div class="agent-card" style="border-left-color:{layer_color};">
+  <div class="agent-layer" style="color:{layer_color};">{layer_label}</div>
+  <div class="agent-name">{agent.agent_id.replace("_"," ").title()}</div>
+  <div class="agent-role">{role_desc}</div>
+  <div class="agent-stats">
+    <span class="stat-badge">Calls: {stats["total_calls"]}</span>
+    <span class="stat-badge">Avg: {avg_time:.3f} ms</span>
+    <span class="stat-badge">Total: {stats["total_time_ms"]:.2f} ms</span>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        st.divider()
+        # ── Dataset Comparison Panel ─────────────────────────────────────────
+        st.subheader("📊 Dataset Comparison")
+        dataset_id = st.session_state.get("dataset_id","SYN")
+        ds_label   = {"SYN":"Synthetic Generator","DS1":"Dataset 1 (Custom CSV)","DS2":"Dataset 2 (TON_IoT)"}.get(dataset_id,"Current")
+        if "comparison_results" not in st.session_state:
+            st.session_state["comparison_results"] = {}
+        # Store current run metrics
+        metrics_now = fw.threat_classifier_agent.get_performance_metrics()
+        if "error" not in metrics_now:
+            st.session_state["comparison_results"][ds_label] = {
+                "Accuracy":           metrics_now["accuracy"],
+                "Precision (W.Avg)":  metrics_now["precision_weighted"],
+                "Recall (W.Avg)":     metrics_now["recall_weighted"],
+                "F1 Score (W.Avg)":   metrics_now["f1_weighted"],
+                "Avg Detection (ms)": metrics_now["avg_detection_time_ms"],
+                "Total Predictions":  metrics_now["total_predictions"],
+            }
+        comp = st.session_state["comparison_results"]
+        if len(comp) >= 1:
+            df_comp = pd.DataFrame(comp).T.reset_index().rename(columns={"index":"Dataset"})
+            st.dataframe(df_comp, use_container_width=True, hide_index=True)
+            if _PLOTLY and len(comp) >= 2:
+                st.subheader("Cross-Dataset Performance Comparison")
+                metrics_to_plot = ["Accuracy","Precision (W.Avg)","Recall (W.Avg)","F1 Score (W.Avg)"]
+                ds_names  = list(comp.keys())
+                bar_colors = ["#2E75B6","#E63946","#2A9D8F","#E9C46A"]
+                fig_comp = go.Figure()
+                for mi, metric in enumerate(metrics_to_plot):
+                    vals = [comp[ds].get(metric, 0) for ds in ds_names]
+                    fig_comp.add_trace(go.Bar(
+                        name=metric, x=ds_names, y=vals,
+                        marker_color=bar_colors[mi],
+                        text=[f"{v:.3f}" for v in vals], textposition="outside"))
+                fig_comp.update_layout(
+                    barmode="group", yaxis=dict(range=[0,1.1], title="Score"),
+                    xaxis_title="Dataset",
+                    legend=dict(orientation="h",y=-0.3),
+                    margin=dict(l=40,r=20,t=20,b=80), height=380,
+                    plot_bgcolor="#F8FAFF", paper_bgcolor="#F8FAFF")
+                st.plotly_chart(fig_comp, use_container_width=True)
+                st.caption("Run the simulation on both datasets to populate this chart. Results persist across runs within the same session.")
+            elif len(comp) == 1:
+                st.info("💡 Run the simulation on a second dataset to see the comparison chart here.")
+        else:
+            st.info("No metrics yet — run the simulation first.")
+
+        st.divider()
         st.subheader("Monitor Report")
         report = fw.performance_monitor.generate_report()
         if report:
